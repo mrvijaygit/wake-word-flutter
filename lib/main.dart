@@ -52,6 +52,9 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
   late List<int> _inputShape;
   late List<int> _outputShape;
 
+  final List<double> _recentScores = []; // Track recent scores
+  int _consecutiveDetections = 0;
+
   @override
   void initState() {
     super.initState();
@@ -328,20 +331,12 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         return;
       }
 
-      // Debug: Print shapes to verify
-      print('MFCC shape: $timeSteps x $nMfcc');
-      print('Expected input shape: $_inputShape');
-
       // Prepare input tensor matching model's expected shape
-      // Model expects: [1, time_steps, n_mfcc, 1]
       var input = List.generate(
-        1, // batch size
+        1,
         (_) => List.generate(
-          timeSteps, // time dimension
-          (t) => List.generate(
-            nMfcc, // feature dimension
-            (f) => [mfccFeatures[t][f]], // channel dimension
-          ),
+          timeSteps,
+          (t) => List.generate(nMfcc, (f) => [mfccFeatures[t][f]]),
         ),
       );
 
@@ -359,20 +354,55 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
           ? output[0][0] as double
           : double.parse(output[0][0].toString());
 
-      const double threshold = 0.50;
+      // CRITICAL FIX: Much higher threshold
+      const double threshold = 0.85; // Increased from 0.50 to 0.85
+      const int requiredConsecutiveDetections =
+          2; // Require 2 consecutive detections
 
-      print('Detection score: ${(score * 100).toStringAsFixed(1)}%');
+      // Track recent scores for debugging
+      _recentScores.add(score);
+      if (_recentScores.length > 10) {
+        _recentScores.removeAt(0);
+      }
 
+      // Calculate average of recent scores
+      double avgScore =
+          _recentScores.reduce((a, b) => a + b) / _recentScores.length;
+
+      print(
+        'Score: ${(score * 100).toStringAsFixed(1)}% | Avg: ${(avgScore * 100).toStringAsFixed(1)}%',
+      );
+
+      // IMPROVED DETECTION LOGIC
       if (score > threshold) {
-        _onWakeWordDetected('hey barns', score);
+        _consecutiveDetections++;
+
+        if (_consecutiveDetections >= requiredConsecutiveDetections) {
+          // Additional check: average score should also be high
+          if (avgScore > 0.75) {
+            _onWakeWordDetected('hey barns', score);
+            _consecutiveDetections = 0; // Reset
+          }
+        }
+      } else {
+        // Reset if score drops below threshold
+        if (score < 0.65) {
+          // Hysteresis
+          _consecutiveDetections = 0;
+        }
+      }
+
+      // DEBUG: Show why detection isn't triggering
+      if (score > 0.5 && score < threshold) {
+        print(
+          '⚠️  Score ${(score * 100).toStringAsFixed(1)}% below threshold ${(threshold * 100).toStringAsFixed(1)}%',
+        );
       }
     } catch (e, st) {
       print('Detection error: $e');
       print('Stack trace: $st');
     }
   }
-
-  // Keep your existing _extractMFCC and _createMelFilterbank methods unchanged
 
   void _onWakeWordDetected(String keyword, double confidence) {
     if (!_wakeWordDetected) {
@@ -383,7 +413,9 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         _statusMessage = 'Wake word detected!';
       });
 
-      print('Wake word detected: $keyword with confidence: $confidence');
+      print(
+        '✅ Wake word CONFIRMED: $keyword (${(confidence * 100).toStringAsFixed(1)}%)',
+      );
 
       _showSnackBar(
         'Detected: $keyword (${(confidence * 100).toStringAsFixed(1)}%)',
@@ -408,12 +440,14 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         ),
       );
 
-      // Reset after 2 seconds
-      Future.delayed(const Duration(seconds: 2), () {
+      // Reset after 3 seconds (increased cooldown)
+      Future.delayed(const Duration(seconds: 3), () {
         if (mounted && _isListening) {
           setState(() {
             _wakeWordDetected = false;
             _statusMessage = 'Listening for "hey barns"...';
+            _consecutiveDetections = 0;
+            _recentScores.clear();
           });
         }
       });
