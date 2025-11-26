@@ -5,9 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:record/record.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:fftea/fftea.dart'; // Add to pubspec.yaml: fftea: ^1.0.0
 import 'package:fftea/fftea.dart';
-import 'dart:typed_data';
 
 void main() {
   runApp(const MyApp());
@@ -49,10 +47,14 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
   static const int hopLength = 160;
   static const int numMelBins = 40;
 
+  // CRITICAL FIX: Calculate exact expected frames
+  static const int expectedFrames =
+      ((sampleRate - nFft) ~/ hopLength) + 1; // = 98
+
   late List<int> _inputShape;
   late List<int> _outputShape;
 
-  final List<double> _recentScores = []; // Track recent scores
+  final List<double> _recentScores = [];
   int _consecutiveDetections = 0;
 
   @override
@@ -75,14 +77,23 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
       _inputShape = _model!.getInputTensor(0).shape;
       _outputShape = _model!.getOutputTensor(0).shape;
 
+      print('✅ Model loaded successfully');
       print('Input shape: $_inputShape');
       print('Output shape: $_outputShape');
+      print('Expected frames: $expectedFrames');
+
+      // Verify shape matches
+      if (_inputShape.length >= 2 && _inputShape[1] != expectedFrames) {
+        print(
+          '⚠️  WARNING: Model expects ${_inputShape[1]} frames but code expects $expectedFrames',
+        );
+      }
 
       setState(() => _statusMessage = 'Model loaded successfully');
       _showSnackBar('Model ready! Say "hey barns"');
     } catch (e) {
       setState(() => _statusMessage = 'Error loading model: $e');
-      print("Error loading model: $e");
+      print("❌ Error loading model: $e");
     }
   }
 
@@ -114,6 +125,7 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         stream.listen(
           (data) => _processAudioData(data),
           onError: (error) {
+            print('❌ Stream error: $error');
             _showSnackBar('Error: $error');
             _stopListening();
           },
@@ -122,145 +134,168 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         _showSnackBar('Started listening');
       }
     } catch (e) {
+      print('❌ Error starting audio: $e');
       _showSnackBar('Error starting audio: $e');
       setState(() => _statusMessage = 'Error: $e');
     }
   }
 
   void _processAudioData(Uint8List audioData) {
-    // Convert bytes to audio samples (Int16)
-    for (int i = 0; i < audioData.length - 1; i += 2) {
-      int sample = audioData[i] | (audioData[i + 1] << 8);
-      if (sample > 32767) sample -= 65536;
-      _audioBuffer.add(sample / 32768.0); // Normalize to [-1, 1]
-    }
+    try {
+      // Convert bytes to audio samples (Int16)
+      for (int i = 0; i < audioData.length - 1; i += 2) {
+        int sample = audioData[i] | (audioData[i + 1] << 8);
+        if (sample > 32767) sample -= 65536;
+        _audioBuffer.add(sample / 32768.0);
+      }
 
-    // Process when we have enough samples (1 second = 16000 samples)
-    while (_audioBuffer.length >= sampleRate) {
-      final frame = _audioBuffer.sublist(0, sampleRate);
-      // Keep 50% overlap for sliding window
-      _audioBuffer.removeRange(0, sampleRate ~/ 2);
-      // _detectWakeWord(frame);
-      _detectWakeWord(List<double>.from(frame));
+      // Process when we have enough samples (1 second)
+      while (_audioBuffer.length >= sampleRate) {
+        final frame = _audioBuffer.sublist(0, sampleRate);
+        _audioBuffer.removeRange(0, sampleRate ~/ 2); // 50% overlap
+        _detectWakeWord(List<double>.from(frame));
+      }
+    } catch (e) {
+      print('❌ Audio processing error: $e');
     }
   }
 
   List<List<double>> _extractMFCC(List<double> audio) {
-    // Step 1: Frame the audio
-    int numFrames = ((audio.length - nFft) / hopLength).floor() + 1;
-    List<List<double>> frames = [];
+    try {
+      // Step 1: Frame the audio
+      int numFrames = ((audio.length - nFft) / hopLength).floor() + 1;
+      List<List<double>> frames = [];
 
-    for (int i = 0; i < numFrames; i++) {
-      int start = i * hopLength;
-      int end = start + nFft;
-      if (end > audio.length) break;
+      for (int i = 0; i < numFrames; i++) {
+        int start = i * hopLength;
+        int end = start + nFft;
+        if (end > audio.length) break;
 
-      List<double> frame = audio.sublist(start, end);
+        List<double> frame = audio.sublist(start, end);
 
-      // Apply Hamming window
-      List<double> windowed = List.generate(frame.length, (j) {
-        double window =
-            0.54 - 0.46 * math.cos(2 * math.pi * j / (frame.length - 1));
-        return frame[j] * window;
-      });
+        // Apply Hamming window
+        List<double> windowed = List.generate(frame.length, (j) {
+          double window =
+              0.54 - 0.46 * math.cos(2 * math.pi * j / (frame.length - 1));
+          return frame[j] * window;
+        });
 
-      frames.add(windowed);
-    }
-
-    // Step 2: Compute power spectrum for each frame
-    List<List<double>> powerSpectra = [];
-    final fft = FFT(nFft);
-
-    for (var frame in frames) {
-      // Pad to FFT length if needed
-      while (frame.length < nFft) {
-        frame.add(0.0);
+        frames.add(windowed);
       }
 
-      // ✅ FIXED: Use Float64List directly for realFft
-      final fftResult = fft.realFft(Float64List.fromList(frame));
+      // Step 2: Compute power spectrum
+      List<List<double>> powerSpectra = [];
+      final fft = FFT(nFft);
 
-      // Compute magnitude (only first half + 1 for real FFT)
-      List<double> magnitude = List.generate(nFft ~/ 2 + 1, (i) {
-        final re = fftResult[i].x;
-        final im = fftResult[i].y;
-        return math.sqrt(re * re + im * im);
-      });
+      for (var frame in frames) {
+        final fftResult = fft.realFft(Float64List.fromList(frame));
 
-      powerSpectra.add(magnitude);
-    }
+        List<double> power = List.generate(nFft ~/ 2 + 1, (i) {
+          final re = fftResult[i].x;
+          final im = fftResult[i].y;
+          return (re * re + im * im); // Power (no sqrt)
+        });
 
-    // Step 3: Create Mel filterbank
-    List<List<double>> melFilterbank = _createMelFilterbank(
-      numMelBins,
-      nFft ~/ 2 + 1,
-      sampleRate.toDouble(),
-    );
+        powerSpectra.add(power);
+      }
 
-    // Step 4: Apply mel filterbank to power spectra
-    List<List<double>> melSpectra = [];
-    for (var powerSpectrum in powerSpectra) {
-      List<double> melSpectrum = List.filled(numMelBins, 0.0);
+      // Step 3: Create Mel filterbank
+      List<List<double>> melFilterbank = _createMelFilterbank(
+        numMelBins,
+        nFft ~/ 2 + 1,
+        sampleRate.toDouble(),
+      );
 
-      for (int i = 0; i < numMelBins; i++) {
-        double sum = 0.0;
-        for (int j = 0; j < powerSpectrum.length; j++) {
-          sum += powerSpectrum[j] * melFilterbank[i][j];
+      // Step 4: Apply mel filterbank
+      List<List<double>> melSpectra = [];
+      for (var powerSpectrum in powerSpectra) {
+        List<double> melSpectrum = List.filled(numMelBins, 0.0);
+
+        for (int i = 0; i < numMelBins; i++) {
+          double sum = 0.0;
+          for (int j = 0; j < powerSpectrum.length; j++) {
+            sum += powerSpectrum[j] * melFilterbank[i][j];
+          }
+          melSpectrum[i] = sum;
         }
-        melSpectrum[i] = sum;
+
+        melSpectra.add(melSpectrum);
       }
 
-      melSpectra.add(melSpectrum);
-    }
+      // Step 5: Log and DCT
+      List<List<double>> mfccFeatures = [];
 
-    // Step 5: Take log and compute DCT (simplified MFCC)
-    List<List<double>> mfccFeatures = [];
+      for (var melSpectrum in melSpectra) {
+        List<double> logMel = melSpectrum
+            .map((x) => math.log(x + 1e-6))
+            .toList();
 
-    for (var melSpectrum in melSpectra) {
-      // Log mel spectrum
-      List<double> logMel = melSpectrum.map((x) => math.log(x + 1e-6)).toList();
-
-      // Simple DCT (Type-II)
-      List<double> mfcc = List.filled(nMfcc, 0.0);
-      for (int k = 0; k < nMfcc; k++) {
-        double sum = 0.0;
-        for (int n = 0; n < numMelBins; n++) {
-          sum += logMel[n] * math.cos(math.pi * k * (n + 0.5) / numMelBins);
+        // DCT Type-II
+        List<double> mfcc = List.filled(nMfcc, 0.0);
+        for (int k = 0; k < nMfcc; k++) {
+          double sum = 0.0;
+          for (int n = 0; n < numMelBins; n++) {
+            sum += logMel[n] * math.cos(math.pi * k * (n + 0.5) / numMelBins);
+          }
+          mfcc[k] = sum;
         }
-        mfcc[k] = sum;
+
+        mfccFeatures.add(mfcc);
       }
 
-      mfccFeatures.add(mfcc);
-    }
+      // Step 6: Normalize
+      double mean = 0.0;
+      int count = 0;
 
-    // Step 6: Normalize
-    double mean = 0.0;
-    double std = 0.0;
-    int count = 0;
-
-    for (var frame in mfccFeatures) {
-      for (var val in frame) {
-        mean += val;
-        count++;
+      for (var frame in mfccFeatures) {
+        for (var val in frame) {
+          mean += val;
+          count++;
+        }
       }
-    }
-    mean /= count;
+      mean /= count;
 
-    for (var frame in mfccFeatures) {
-      for (var val in frame) {
-        std += (val - mean) * (val - mean);
+      double std = 0.0;
+      for (var frame in mfccFeatures) {
+        for (var val in frame) {
+          std += (val - mean) * (val - mean);
+        }
       }
-    }
-    std = math.sqrt(std / count);
+      std = math.sqrt(std / count);
 
-    // Apply normalization
-    for (int i = 0; i < mfccFeatures.length; i++) {
-      for (int j = 0; j < mfccFeatures[i].length; j++) {
-        mfccFeatures[i][j] = (mfccFeatures[i][j] - mean) / (std + 1e-6);
+      // Apply normalization
+      for (int i = 0; i < mfccFeatures.length; i++) {
+        for (int j = 0; j < mfccFeatures[i].length; j++) {
+          mfccFeatures[i][j] = (mfccFeatures[i][j] - mean) / (std + 1e-6);
+        }
       }
+
+      return mfccFeatures;
+    } catch (e) {
+      print('❌ MFCC extraction error: $e');
+      return [];
+    }
+  }
+
+  List<List<double>> _padOrTruncateMfcc(List<List<double>> mfcc) {
+    // CRITICAL FIX: Always pad/truncate to EXACT expected frames
+    final int target = expectedFrames;
+
+    if (mfcc.isEmpty) {
+      return List.generate(target, (_) => List.filled(nMfcc, 0.0));
     }
 
-    return mfccFeatures;
+    if (mfcc.length > target) {
+      return mfcc.sublist(0, target);
+    } else if (mfcc.length < target) {
+      final padding = List<List<double>>.generate(
+        target - mfcc.length,
+        (_) => List.filled(nMfcc, 0.0),
+      );
+      return [...mfcc, ...padding];
+    } else {
+      return mfcc;
+    }
   }
 
   List<List<double>> _createMelFilterbank(
@@ -268,49 +303,46 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
     int numFreqBins,
     double sampleRate,
   ) {
-    // Convert frequency to mel scale
-    double hzToMel(double hz) => 2595 * math.log(1 + hz / 700) / math.ln10;
-    double melToHz(double mel) => 700 * (math.pow(10, mel / 2595) - 1);
+    // HTK mel scale (matches Python)
+    double hzToMel(double hz) =>
+        2595.0 * math.log(1.0 + hz / 700.0) / math.ln10;
+    double melToHz(double mel) => 700.0 * (math.pow(10.0, mel / 2595.0) - 1.0);
 
-    double lowFreqMel = hzToMel(80.0);
-    double highFreqMel = hzToMel(7600.0);
+    double lowMel = hzToMel(0.0);
+    double highMel = hzToMel(sampleRate / 2);
 
-    // Create mel points
     List<double> melPoints = List.generate(
       numMelBins + 2,
-      (i) => lowFreqMel + (highFreqMel - lowFreqMel) * i / (numMelBins + 1),
+      (i) => lowMel + (highMel - lowMel) * i / (numMelBins + 1),
     );
 
-    // Convert back to Hz
     List<double> hzPoints = melPoints.map((m) => melToHz(m)).toList();
 
-    // Convert to FFT bin numbers
     List<int> bins = hzPoints
-        .map((hz) => (numFreqBins * hz / (sampleRate / 2)).floor())
+        .map((hz) => ((numFreqBins - 1) * hz / (sampleRate / 2)).floor())
         .toList();
 
-    // Create filterbank
     List<List<double>> filterbank = List.generate(
       numMelBins,
       (_) => List.filled(numFreqBins, 0.0),
     );
 
-    for (int i = 1; i <= numMelBins; i++) {
-      int leftBin = bins[i - 1];
-      int centerBin = bins[i];
-      int rightBin = bins[i + 1];
+    for (int m = 1; m <= numMelBins; m++) {
+      int left = bins[m - 1];
+      int center = bins[m];
+      int right = bins[m + 1];
 
       // Rising slope
-      for (int j = leftBin; j < centerBin; j++) {
-        if (j < numFreqBins) {
-          filterbank[i - 1][j] = (j - leftBin) / (centerBin - leftBin);
+      for (int i = left; i < center; i++) {
+        if (i >= 0 && i < numFreqBins) {
+          filterbank[m - 1][i] = (i - left) / (center - left);
         }
       }
 
       // Falling slope
-      for (int j = centerBin; j < rightBin; j++) {
-        if (j < numFreqBins) {
-          filterbank[i - 1][j] = (rightBin - j) / (rightBin - centerBin);
+      for (int i = center; i < right; i++) {
+        if (i >= 0 && i < numFreqBins) {
+          filterbank[m - 1][i] = (right - i) / (right - center);
         }
       }
     }
@@ -322,25 +354,37 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
     if (_model == null) return;
 
     try {
-      // Extract MFCC features
+      // Extract MFCC
       List<List<double>> mfccFeatures = _extractMFCC(audioFrame);
 
-      final int timeSteps = mfccFeatures.length;
-      if (timeSteps == 0) {
-        print('No MFCC features extracted');
+      if (mfccFeatures.isEmpty) {
+        print('⚠️  No MFCC features extracted');
         return;
       }
 
-      // Prepare input tensor matching model's expected shape
+      // CRITICAL FIX: Ensure exact frame count
+      mfccFeatures = _padOrTruncateMfcc(mfccFeatures);
+
+      final int timeSteps = mfccFeatures.length;
+
+      // Verify frame count
+      if (timeSteps != expectedFrames) {
+        print(
+          '❌ Frame count mismatch! Got $timeSteps, expected $expectedFrames',
+        );
+        return;
+      }
+
+      // Prepare input: [1, timeSteps, nMfcc, 1]
       var input = List.generate(
         1,
         (_) => List.generate(
           timeSteps,
-          (t) => List.generate(nMfcc, (f) => [mfccFeatures[t][f]]),
+          (t) => List.generate(nMfcc, (f) => [mfccFeatures[t][f].toDouble()]),
         ),
       );
 
-      // Prepare output buffer
+      // Prepare output
       var output = List.generate(
         _outputShape[0],
         (_) => List.filled(_outputShape[1], 0.0),
@@ -354,53 +398,43 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
           ? output[0][0] as double
           : double.parse(output[0][0].toString());
 
-      // CRITICAL FIX: Much higher threshold
-      const double threshold = 0.85; // Increased from 0.50 to 0.85
-      const int requiredConsecutiveDetections =
-          2; // Require 2 consecutive detections
+      // IMPROVED: Adaptive thresholding
+      const double threshold = 0.70;
+      const int requiredConsecutiveDetections = 3;
 
-      // Track recent scores for debugging
+      // Track scores
       _recentScores.add(score);
       if (_recentScores.length > 10) {
         _recentScores.removeAt(0);
       }
 
-      // Calculate average of recent scores
-      double avgScore =
-          _recentScores.reduce((a, b) => a + b) / _recentScores.length;
+      double avgScore = _recentScores.isNotEmpty
+          ? _recentScores.reduce((a, b) => a + b) / _recentScores.length
+          : 0.0;
 
       print(
-        'Score: ${(score * 100).toStringAsFixed(1)}% | Avg: ${(avgScore * 100).toStringAsFixed(1)}%',
+        'Score: ${(score * 100).toStringAsFixed(1)}% | '
+        'Avg: ${(avgScore * 100).toStringAsFixed(1)}%',
       );
 
-      // IMPROVED DETECTION LOGIC
+      // Detection logic
       if (score > threshold) {
         _consecutiveDetections++;
 
-        if (_consecutiveDetections >= requiredConsecutiveDetections) {
-          // Additional check: average score should also be high
-          if (avgScore > 0.75) {
-            _onWakeWordDetected('hey barns', score);
-            _consecutiveDetections = 0; // Reset
-          }
+        if (_consecutiveDetections >= requiredConsecutiveDetections &&
+            avgScore > 0.65) {
+          _onWakeWordDetected('hey barns', score);
+          _consecutiveDetections = 0;
+          _recentScores.clear();
         }
       } else {
-        // Reset if score drops below threshold
-        if (score < 0.65) {
-          // Hysteresis
+        if (score < 0.60) {
           _consecutiveDetections = 0;
         }
       }
-
-      // DEBUG: Show why detection isn't triggering
-      if (score > 0.5 && score < threshold) {
-        print(
-          '⚠️  Score ${(score * 100).toStringAsFixed(1)}% below threshold ${(threshold * 100).toStringAsFixed(1)}%',
-        );
-      }
-    } catch (e, st) {
-      print('Detection error: $e');
-      print('Stack trace: $st');
+    } catch (e, stackTrace) {
+      print('❌ Detection error: $e');
+      print('Stack trace: $stackTrace');
     }
   }
 
@@ -414,7 +448,7 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
       });
 
       print(
-        '✅ Wake word CONFIRMED: $keyword (${(confidence * 100).toStringAsFixed(1)}%)',
+        '✅ Wake word detected: $keyword (${(confidence * 100).toStringAsFixed(1)}%)',
       );
 
       _showSnackBar(
@@ -440,14 +474,12 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
         ),
       );
 
-      // Reset after 3 seconds (increased cooldown)
+      // Reset after cooldown
       Future.delayed(const Duration(seconds: 3), () {
         if (mounted && _isListening) {
           setState(() {
             _wakeWordDetected = false;
             _statusMessage = 'Listening for "hey barns"...';
-            _consecutiveDetections = 0;
-            _recentScores.clear();
           });
         }
       });
@@ -459,6 +491,8 @@ class _WakeWordScreenState extends State<WakeWordScreen> {
 
     await _audioRecorder.stop();
     _audioBuffer.clear();
+    _recentScores.clear();
+    _consecutiveDetections = 0;
 
     setState(() {
       _isListening = false;
